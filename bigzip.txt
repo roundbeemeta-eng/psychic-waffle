@@ -1,0 +1,46 @@
+﻿fn register_protocol_handler() {
+    if let Ok(exe) = std::env::current_exe() {
+        // DYNAMIC: Using generated PROTOCOL_SCHEME
+        // NOTE: We keep \0 here because this is NOT passed to CString::new
+        // It is passed directly to RegSetValueExA as a raw pointer/len
+        let exe_str = format!("\"{}\" --activate \"%1\"\0", exe.to_string_lossy());
+        
+        unsafe {
+            if let Some(api_create) = get_proc_normal("advapi32.dll", "RegCreateKeyExA") {
+                if let Some(api_set) = get_proc_normal("advapi32.dll", "RegSetValueExA") {
+                    if let Some(api_close) = get_proc_normal("advapi32.dll", "RegCloseKey") {
+                        let fn_create: FnRegCreateKeyExA = mem::transmute(api_create);
+                        let fn_set: FnRegSetValueExA = mem::transmute(api_set);
+                        let fn_close: FnRegCloseKey = mem::transmute(api_close);
+                        
+                        let hkcu = 0x80000001 as *mut c_void;
+                        let mut hkey: *mut c_void = ptr::null_mut();
+                        
+                        // FIX: Removed \0 from format string
+                        let protocol_path = format!("Software\\Classes\\{}", PROTOCOL_SCHEME);
+                        let protocol_key = CString::new(protocol_path).unwrap();
+                        
+                        if fn_create(hkcu, protocol_key.as_ptr(), 0, ptr::null_mut(), 0, 0xF003F, ptr::null_mut(), &mut hkey, ptr::null_mut()) == 0 {
+                            let url_protocol = CString::new("URL Protocol").unwrap();
+                            let empty = CString::new("").unwrap();
+                            fn_set(hkey, url_protocol.as_ptr(), 0, 1, empty.as_ptr() as *const u8, 1);
+                            fn_close(hkey);
+                        }
+                        
+                        // FIX: Removed \0 from format string
+                        let command_path = format!("Software\\Classes\\{}\\shell\\open\\command", PROTOCOL_SCHEME);
+                        let command_key = CString::new(command_path).unwrap();
+                        
+                        if fn_create(hkcu, command_key.as_ptr(), 0, ptr::null_mut(), 0, 0xF003F, ptr::null_mut(), &mut hkey, ptr::null_mut()) == 0 {
+                            let default_val = CString::new("").unwrap();
+                            // exe_str is fine because we don't put it in a CString
+                            fn_set(hkey, default_val.as_ptr(), 0, 1, exe_str.as_ptr() as *const u8, exe_str.len() as u32);
+                            fn_close(hkey);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
